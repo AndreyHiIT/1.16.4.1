@@ -1,0 +1,219 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"sync"
+	"time"
+
+	"github.com/eiannone/keyboard"
+	"github.com/gosuri/uilive"
+	"github.com/guptarohit/asciigraph"
+)
+
+const (
+	btcUSD = "BTCUSDT"
+	ltcUSD = "LTCUSDT"
+	ethUSD = "ETHUSDT"
+)
+
+// PriceData хранит данные о цене актива
+type PriceData struct {
+	Symbol    string  `json:"symbol"`
+	Price     float64 `json:"price,string"`
+	Timestamp int64   `json:"-"`
+}
+
+var (
+	prices []float64
+	mu     sync.Mutex
+)
+
+// API для получения цен
+func fetchPrice(symbol string) (PriceData, error) {
+	url := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%s", symbol)
+	resp, err := http.Get(url)
+	if err != nil {
+		return PriceData{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return PriceData{}, fmt.Errorf("failed to fetch data: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return PriceData{}, err
+	}
+
+	var priceData PriceData
+	if err := json.Unmarshal(body, &priceData); err != nil {
+		return PriceData{}, err
+	}
+
+	priceData.Timestamp = time.Now().Unix()
+	return priceData, nil
+}
+
+// clearTerminal очищает терминал
+func clearTerminal() {
+	cmd := exec.Command("clear") // Для Unix
+	cmd.Stdout = os.Stdout
+	cmd.Run()
+}
+
+// Меню для выбора актива
+func menu(currentSymbol *string, priceChan chan PriceData, inputWait chan bool) {
+
+	fmt.Println("Выберите актив:")
+	fmt.Println("1. BTC_USD")
+	fmt.Println("2. LTC_USD")
+	fmt.Println("3. ETH_USD")
+	fmt.Println("Нажмите 1-3 для смены символа, q для выхода")
+
+Cikle:
+	for {
+		runs, _, err := keyboard.GetKey()
+		if err != nil {
+			fmt.Println("Ошибка при чтении клавиши:", err)
+			return
+		}
+
+		mu.Lock()
+
+		switch runs {
+		case 49:
+			*currentSymbol = btcUSD
+			inputWait <- true
+			break Cikle
+		case 50:
+			*currentSymbol = ltcUSD
+			inputWait <- true
+			break Cikle
+		case 51:
+			*currentSymbol = ethUSD
+			inputWait <- true
+			break Cikle
+		case 113: // клавиша q
+			keyboard.Close()
+			mu.Unlock()
+			fmt.Println("Выходим...")
+			os.Exit(0)
+		default:
+			fmt.Println("Неверный выбор, попробуйте снова.")
+		}
+		mu.Unlock()
+	}
+	mu.Unlock()
+	graph(currentSymbol, priceChan)
+
+}
+
+// интерфейс для отображения графика
+func graph(currentSymbol *string, priceChan chan PriceData) {
+	doneChan := make(chan bool)
+	fmt.Println("the graph has starded")
+	go func() {
+		writer := uilive.New()
+		writer.Start()
+		defer writer.Stop()
+
+		for priceData := range priceChan {
+
+			select {
+			case <-doneChan:
+				return
+			default:
+
+				mu.Lock()
+				prices = append(prices, priceData.Price)
+				if len(prices) > 100 { // Ограничиваем длину графика
+					prices = prices[1:]
+				}
+				mu.Unlock()
+
+				// Получаем текущее время и дату
+				currentTime := time.Now().Format("2006-01-02 15:04:05")
+				// Обновляем график
+				graph := asciigraph.Plot(prices, asciigraph.Width(100), asciigraph.Height(10))
+
+				// Очищаем терминал
+				clearTerminal()
+
+				// Составляем новый вывод
+				output := fmt.Sprintf("График для: %s\n%s\nТекущее время: %s\nДля выхода из программы нажмите q\nЧтобы вернуться в меню нажмите Backspace\n", *currentSymbol, graph, currentTime)
+				// Обновляем весь вывод
+				writer.Write([]byte(output))
+
+				// Добавляем небольшую задержку для улучшения визуального восприятия
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+	}()
+
+	for {
+		runs, key, err := keyboard.GetKey()
+		if err != nil {
+			fmt.Println("Ошибка при чтении клавиши:", err)
+			return
+		}
+		mu.Lock()
+		// Если нажата клавиша Backspace, выполняем действие
+		if key == 127 {
+			go func() {
+				doneChan <- true
+			}()
+			mu.Unlock()
+			return
+		} else {
+			if runs == 113 {
+				keyboard.Close()
+				mu.Unlock()
+				fmt.Println("Выходим...")
+				os.Exit(0)
+			}
+		}
+		mu.Unlock()
+	}
+
+}
+
+func main() {
+	var currentSymbol string
+
+	// Создаем канал для обновлений
+	priceChan := make(chan PriceData)
+
+	//Канал для ожидания ввода значения
+	inputWait := make(chan bool)
+
+	err := keyboard.Open()
+	if err != nil {
+		fmt.Println("Ошибка при открытии клавиатуры:", err)
+		return
+	}
+	defer keyboard.Close()
+	// Запускаем воркер для получения данных
+	go func() {
+		<-inputWait
+		for {
+			priceData, err := fetchPrice(currentSymbol)
+			if err != nil {
+				log.Println("Error fetching price:", err)
+				continue
+			}
+			priceChan <- priceData
+			time.Sleep(1 * time.Second) // задержка в 1 секунду
+		}
+	}()
+
+	for {
+		menu(&currentSymbol, priceChan, inputWait)
+	}
+}
